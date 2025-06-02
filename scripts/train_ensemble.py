@@ -1,67 +1,100 @@
 #!/usr/bin/env python3
-import argparse
-import numpy as np
+"""
+Train (or re-train) the logistic-regression ensemble on a JSONL training file.
+It extracts 3 features per text:
+    • curvature (Lens-1)
+    • compression anomaly (Lens-2)
+    • syntax-gcn probability (Lens-3)
+
+Example:
+    python -m scripts.train_ensemble \
+        --train_jsonl data/train.jsonl \
+        --gcn_ckpt   models/syntax_gcn_balanced_10k.pt \
+        --out        models/ensemble.pkl
+"""
+import json
 import joblib
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import GridSearchCV
-from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support, classification_report
+import argparse
+import torch
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from tqdm.auto import tqdm
 
-def main(train_features_path: str,
-         dev_features_path: str,
-         output_model: str,
-         threshold_path: str):
-    # Load train features
-    data_train = np.load(train_features_path)
-    X_train, y_train = data_train['X'], data_train['y']
+from lenses.lens1_curvature import PerturbationCurvature
+from lenses.lens2_compress import CompressionAnomaly
+from lenses.lens3_syntax_gcn import SyntaxGCN, doc_to_graph
 
-    # Load dev features for threshold calibration
-    data_dev = np.load(dev_features_path)
-    X_dev, y_dev = data_dev['X'], data_dev['y']
 
-    # 1) Hyperparameter search over RF
-    param_grid = {
-        'n_estimators': [50, 100, 200],
-        'max_depth':    [None, 5, 10],
-    }
-    rf = RandomForestClassifier(random_state=42)
-    grid = GridSearchCV(rf, param_grid, scoring='f1', cv=5, n_jobs=-1)
-    grid.fit(X_train, y_train)
-    best_clf = grid.best_estimator_
-    print(f"Best RF params: {grid.best_params_}")
+def main(args):
+    # device can be "cuda", "cpu", or "cuda:0", etc.
+    dev = args.device
 
-    # 2) Calibrate threshold on dev
-    probs_dev = best_clf.predict_proba(X_dev)[:, 1]
-    best_thr, best_f1 = 0.0, 0.0
-    for thr in np.linspace(0, 1, 101):
-        preds = (probs_dev > thr).astype(int)
-        f1 = f1_score(y_dev, preds)
-        if f1 > best_f1:
-            best_f1, best_thr = f1, thr
+    # initialize your three feature extractors
+    curv = PerturbationCurvature(device=dev)
+    comp = CompressionAnomaly()
 
-    # 3) Report dev‐set performance
-    preds_dev = (probs_dev > best_thr).astype(int)
-    acc_dev = accuracy_score(y_dev, preds_dev)
-    prec, rec, f1_dev, _ = precision_recall_fscore_support(y_dev, preds_dev, average='binary')
-    print(f"\nDev performance @ thr={best_thr:.2f}: Acc={acc_dev:.4f}, F1={f1_dev:.4f}, P={prec:.4f}, R={rec:.4f}")
-    print("\nFull dev report:")
-    print(classification_report(y_dev, preds_dev, target_names=['human','ai']))
+    # load the GCN
+    in_dim = doc_to_graph("dummy").x.size(1)
+    gcn = SyntaxGCN(in_dim=in_dim).to(dev)
+    gcn.load_state_dict(torch.load(args.gcn_ckpt, map_location=dev))
+    gcn.eval()
 
-    # 4) Save model + threshold
-    joblib.dump(best_clf, output_model)
-    np.save(threshold_path, np.array([best_thr]))
-    print(f"\nSaved RF ensemble to {output_model}, threshold to {threshold_path}")
+    def gcn_score(txt: str) -> float:
+        g = doc_to_graph(txt)
+        g.batch = torch.zeros(g.x.size(0), dtype=torch.long)
+        with torch.no_grad():
+            return torch.sigmoid(gcn(g.to(dev))).item()
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(
-        description="Train RF ensemble on train + calibrate on dev"
+    # 1) Pre-count lines for an accurate ETA
+    with open(args.train_jsonl, "r", encoding="utf8") as f:
+        total = sum(1 for _ in f)
+
+    X, y = [], []
+    # 2) Rigorous tqdm bar with ETA and postfix stats
+    with open(args.train_jsonl, "r", encoding="utf8") as fh:
+        pbar = tqdm(
+            fh,
+            desc="⟳ extracting features",
+            total=total,
+            unit="samples",
+            dynamic_ncols=True,
+            mininterval=1.0,
+            smoothing=0.3,
+        )
+        for row in pbar:
+            obj = json.loads(row)
+            y.append(obj["label"])
+            txt = obj["text"]
+
+            c1 = curv.score(txt)
+            c2 = comp.score(txt)
+            c3 = gcn_score(txt)
+            X.append([c1, c2, c3])
+
+            # 3) Display the latest feature values in the bar
+            pbar.set_postfix(
+                curv=f"{c1:.3f}",
+                comp=f"{c2:.3f}",
+                gcn=f"{c3:.3f}",
+                refresh=False,
+            )
+
+    # fit & dump
+    model = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(max_iter=1_000, class_weight="balanced"),
     )
-    parser.add_argument('--train_features', required=True,
-                        help='.npz with train X,y')
-    parser.add_argument('--dev_features',   required=True,
-                        help='.npz with dev   X,y')
-    parser.add_argument('--output_model',   required=True,
-                        help='where to write RF .pkl')
-    parser.add_argument('--threshold_path', required=True,
-                        help='where to write threshold .npy')
+    model.fit(X, y)
+    joblib.dump(model, args.out)
+    print("✓ saved ensemble →", args.out)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_jsonl", required=True, help="Path to JSONL training file")
+    parser.add_argument("--gcn_ckpt",    required=True, help="Path to syntax-GCN checkpoint (.pt)")
+    parser.add_argument("--out",         required=True, help="Where to write the ensemble (.pkl)")
+    parser.add_argument("--device",      default="cuda", help="torch device string (cuda or cpu)")
     args = parser.parse_args()
-    main(args.train_features, args.dev_features, args.output_model, args.threshold_path)
+    main(args)
