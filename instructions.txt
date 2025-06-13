@@ -1,0 +1,32 @@
+# TriLens Ensemble
+
+## Setup
+
+```bash
+conda create -n trilens python=3.11
+conda activate trilens
+pip install -r requirements.txt
+
+/mnt/data/trilens
+├── data/
+│   └── raw/cs162-final-dev/
+│       ├── arxiv_cohere.jsonl
+│       ├── arxiv_chatGPT.jsonl
+│       ├── reddit_cohere.jsonl
+│       └── reddit_chatGPT.jsonl
+├── models/
+│   ├── ensemble.pkl
+│   └── syntax_gcn_balanced_10k.pt
+├── scripts/
+│   └── evaluate_ensemble2.py
+└── requirements.txt
+
+cd /mnt/data/trilens
+python scripts/evaluate_ensemble2.py \
+  --ckpt models/ensemble.pkl \
+  --gcn models/syntax_gcn_balanced_10k.pt \
+  --threshold 0.01 \
+  data/raw/cs162-final-dev/arxiv_cohere.jsonl \
+  data/raw/cs162-final-dev/arxiv_chatGPT.jsonl \
+  data/raw/cs162-final-dev/reddit_cohere.jsonl \
+  data/raw/cs162-final-dev/reddit_chatGPT.jsonl
